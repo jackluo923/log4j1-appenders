@@ -71,9 +71,8 @@ public abstract class AbstractBufferedRollingFileAppender extends EnhancedAppend
   private long flushHardTimeoutTimestamp;
   private long flushSoftTimeoutTimestamp;
   // The maximum soft timeout allowed. If users wish to continue log collection
-  // and synchronization after appender is interrupted, this value will be
-  // artificiality lowered to increase the likelihood of flushing before the
-  // app terminates.
+  // and synchronization while the JVM is shutting down, this value will be
+  // lowered to increase the likelihood of flushing before the app terminates.
   private long flushMaximumSoftTimeout;
 
   private final BackgroundFlushThread backgroundFlushThread = new BackgroundFlushThread();
@@ -228,6 +227,8 @@ public abstract class AbstractBufferedRollingFileAppender extends EnhancedAppend
       if (closeFileOnShutdown) {
         Runtime.getRuntime().addShutdownHook(new Thread(this::close));
       }
+      backgroundFlushThread.setDaemon(true);
+      backgroundSyncThread.setDaemon(true);
       backgroundFlushThread.start();
       backgroundSyncThread.start();
 
@@ -252,15 +253,31 @@ public abstract class AbstractBufferedRollingFileAppender extends EnhancedAppend
     }
 
     if (closeFileOnShutdown) {
+      // Shutdown the flush thread before we close (so we don't try to flush
+      // after the appender is already closed.
+      backgroundFlushThread.interrupt();
+      try {
+        backgroundFlushThread.join();
+      } catch (InterruptedException e) {
+        logError("Interrupted while joining backgroundFlushThread");
+      }
+
       try {
         closeHook();
       } catch (Exception ex) {
         // Just log the failure but continue the close process
         logError("closeHook failed.", ex);
       }
+
+      // Perform a final sync and then shutdown the sync thread
       backgroundSyncThread.addSyncRequest(baseName, lastRolloverTimestamp, true,
                                           computeSyncRequestMetadata());
       backgroundSyncThread.addShutdownRequest();
+      try {
+        backgroundSyncThread.join();
+      } catch (InterruptedException e) {
+        logError("Interrupted while joining backgroundSyncThread");
+      }
     } else {
       try {
         // Flush now just in case we shut down before a timeout expires (and
@@ -271,6 +288,21 @@ public abstract class AbstractBufferedRollingFileAppender extends EnhancedAppend
       }
       backgroundSyncThread.addSyncRequest(baseName, lastRolloverTimestamp, false,
                                           computeSyncRequestMetadata());
+      // Adjust soft flush timeout to minimal sane value
+      // If warning or error logs is observed, upload logs aggressively
+      timeoutCheckPeriod = 100;   // Check every 100 milliseconds
+      flushMaximumSoftTimeout = 1000;   // 1 second
+
+      // Block inside shutdown hook until SIGKILL
+      // Background threads will continue best-effort to capture and flush logs
+      while (true) {
+        try {
+          backgroundFlushThread.join();
+          backgroundSyncThread.join();
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
     }
 
     closed = true;
@@ -396,14 +428,7 @@ public abstract class AbstractBufferedRollingFileAppender extends EnhancedAppend
   private void resetFreshnessTimeouts () {
     flushHardTimeoutTimestamp = Long.MAX_VALUE;
     flushSoftTimeoutTimestamp = Long.MAX_VALUE;
-    if (Thread.currentThread().isInterrupted()) {
-      // Since the thread has been interrupted (presumably because the app is
-      // being shut down), lower the maximum soft timeout to increase the
-      // likelihood that the log will be synced before the app shuts down.
-      flushMaximumSoftTimeout = flushSoftTimeoutPerLevel.get(Level.FATAL);
-    } else {
-      flushMaximumSoftTimeout = flushSoftTimeoutPerLevel.get(Level.TRACE);
-    }
+    flushMaximumSoftTimeout = flushSoftTimeoutPerLevel.get(Level.TRACE);
   }
 
   /**
